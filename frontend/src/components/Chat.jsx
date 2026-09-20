@@ -411,7 +411,7 @@ export default function Chat() {
             type="file"
             ref={fileInputRef}
             multiple
-            accept=".pdf,.md"
+            accept=".pdf,.md,.markdown"
             onChange={handleFileChange}
             className="hidden-input"
           />

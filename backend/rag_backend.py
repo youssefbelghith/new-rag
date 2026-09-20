@@ -5,7 +5,8 @@ import chromadb
 from typing import List, Dict, Optional, Tuple
 from functools import lru_cache
 
-from langchain_community.document_loaders import PyPDFLoader, UnstructuredMarkdownLoader
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.documents import Document
 from langchain_community.vectorstores import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
@@ -87,7 +88,7 @@ def build_vectorstore_from_files(file_bytes_list: List[Tuple[str, bytes]]):
 
     for name, content in file_bytes_list:
         extension = name.split(".")[-1].lower()
-        if extension not in ["pdf", "md"]:
+        if extension not in ["pdf", "md", "markdown"]:
             continue
 
         # Write bytes to a temporary file for the loader
@@ -98,9 +99,12 @@ def build_vectorstore_from_files(file_bytes_list: List[Tuple[str, bytes]]):
         try:
             if extension == "pdf":
                 loader = PyPDFLoader(tmp.name)
-            elif extension == "md":
-                loader = UnstructuredMarkdownLoader(tmp.name)
-            docs = loader.load()
+                docs = loader.load()
+            else:
+                docs = [Document(
+                    page_content=content.decode("utf-8-sig", errors="replace"),
+                    metadata={"source": name},
+                )]
         finally:
             os.unlink(tmp.name)
 
@@ -139,7 +143,7 @@ def add_single_file_to_vectorstore(uploaded_file, vectordb):
     """Add a single file (must have .name and .read()) to the existing vectorstore."""
     name = uploaded_file.name
     extension = name.split(".")[-1].lower()
-    if extension not in ["pdf", "md"]:
+    if extension not in ["pdf", "md", "markdown"]:
         return vectordb
 
     content = uploaded_file.read()
@@ -150,9 +154,12 @@ def add_single_file_to_vectorstore(uploaded_file, vectordb):
     try:
         if extension == "pdf":
             loader = PyPDFLoader(tmp.name)
-        elif extension == "md":
-            loader = UnstructuredMarkdownLoader(tmp.name)
-        docs = loader.load()
+            docs = loader.load()
+        else:
+            docs = [Document(
+                page_content=content.decode("utf-8-sig", errors="replace"),
+                metadata={"source": name},
+            )]
     finally:
         os.unlink(tmp.name)
 
