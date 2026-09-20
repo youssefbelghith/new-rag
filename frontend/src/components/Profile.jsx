@@ -261,14 +261,13 @@ export default function Profile() {
                       onBlur={() => saveRenaming(h)}
                       onClick={(event) => event.stopPropagation()}
                       onKeyDown={(event) => {
+                        event.stopPropagation();
                         if (event.key === 'Enter') {
                           event.preventDefault();
-                          event.stopPropagation();
                           event.currentTarget.blur();
                         }
                         if (event.key === 'Escape') {
                           event.preventDefault();
-                          event.stopPropagation();
                           skipRenameBlurRef.current = true;
                           cancelRenaming(h);
                         }
