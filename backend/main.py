@@ -12,7 +12,7 @@ from pydantic import BaseModel, EmailStr, Field
 from db_utils import (
     create_user, authenticate_user, get_user_info, ensure_history_schema, create_chat_session,
     get_chat_sessions, get_chat_session, update_chat_session,
-    delete_chat_session, get_chat_session_detail, save_chat_messages
+    delete_chat_session, get_chat_session_detail, save_chat_messages, update_user_avatar
 )
 
 # RAG logic (rewritten without Streamlit)
@@ -48,6 +48,9 @@ class UserCreate(BaseModel):
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
+
+class AvatarUpdate(BaseModel):
+    avatar: str
 
 class Token(BaseModel):
     access_token: str
@@ -180,6 +183,12 @@ async def user_info(user_id: int = Depends(get_current_user)):
     if not info:
         raise HTTPException(status_code=404, detail="User not found")
     return info
+
+@app.put("/user/avatar")
+async def update_avatar(request: AvatarUpdate, user_id: int = Depends(get_current_user)):
+    if not update_user_avatar(user_id, request.avatar):
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"avatar": request.avatar}
 
 @app.get("/user/conversations")
 async def user_conversations(user_id: int = Depends(get_current_user), limit: int = 100):

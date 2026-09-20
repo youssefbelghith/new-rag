@@ -18,6 +18,19 @@ export const AuthProvider = ({ children }) => {
   }, [token]);
 
   useEffect(() => {
+    if (!token) return;
+    axios.get('/user/info')
+      .then(({ data }) => {
+        setUser((current) => {
+          const updated = { ...(current || {}), ...data };
+          localStorage.setItem('user', JSON.stringify(updated));
+          return updated;
+        });
+      })
+      .catch(() => {});
+  }, [token]);
+
+  useEffect(() => {
     const handleUnauthorized = () => {
       localStorage.removeItem('token');
       localStorage.removeItem('user');
@@ -45,9 +58,6 @@ export const AuthProvider = ({ children }) => {
     setUser(null);
   };
 
-  // Persists a data-URL (or hosted URL) as the user's profile photo.
-  // If your backend later exposes an avatar-upload endpoint, this is the
-  // place to also fire an axios.post/put so it survives across devices.
   const updateAvatar = (avatarDataUrl) => {
     setUser((prev) => {
       const updated = { ...(prev || {}), avatar: avatarDataUrl };

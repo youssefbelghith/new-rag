@@ -50,6 +50,9 @@ def ensure_history_schema():
                 "ALTER TABLE conversation_files ADD COLUMN file_timestamp VARCHAR(40) NULL"
             )
         cursor.execute("DROP TABLE IF EXISTS historique")
+        cursor.execute("SHOW COLUMNS FROM utilisateurs LIKE 'avatar'")
+        if cursor.fetchone() is None:
+            cursor.execute("ALTER TABLE utilisateurs ADD COLUMN avatar LONGTEXT NULL")
         cursor.execute(
             "DELETE FROM conversation_files WHERE conversation_id NOT IN "
             "(SELECT id FROM chat_sessions)"
@@ -271,10 +274,27 @@ def get_user_info(user_id):
     try:
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
-            "SELECT nom, prenom, email, date_creation FROM utilisateurs WHERE id = %s",
+            "SELECT nom, prenom, email, date_creation, avatar FROM utilisateurs WHERE id = %s",
             (user_id,)
         )
         return cursor.fetchone()
+    finally:
+        cursor.close()
+        conn.close()
+
+def update_user_avatar(user_id, avatar):
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM utilisateurs WHERE id = %s", (user_id,))
+        if cursor.fetchone() is None:
+            return False
+        cursor.execute(
+            "UPDATE utilisateurs SET avatar = %s WHERE id = %s",
+            (avatar, user_id)
+        )
+        conn.commit()
+        return True
     finally:
         cursor.close()
         conn.close()

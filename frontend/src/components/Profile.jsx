@@ -139,9 +139,16 @@ export default function Profile() {
 
     setAvatarSaving(true);
     const reader = new FileReader();
-    reader.onload = () => {
-      updateAvatar(reader.result);
-      setAvatarSaving(false);
+    reader.onload = async () => {
+      try {
+        await axios.put('/user/avatar', { avatar: reader.result });
+        updateAvatar(reader.result);
+        setInfo((current) => ({ ...(current || {}), avatar: reader.result }));
+      } catch (error) {
+        setAvatarError(error.response?.data?.detail || 'Could not save that image.');
+      } finally {
+        setAvatarSaving(false);
+      }
     };
     reader.onerror = () => {
       setAvatarError('Could not read that image, try another one.');
@@ -166,8 +173,8 @@ export default function Profile() {
           <div className="profile-avatar-wrap">
             <span className="avatar-ring is-lg">
               <span className="avatar-ring-inner">
-                {user?.avatar ? (
-                  <img src={user.avatar} alt="Your profile" className="avatar-img" />
+                {(info?.avatar || user?.avatar) ? (
+                  <img src={info?.avatar || user.avatar} alt="Your profile" className="avatar-img" />
                 ) : (
                   <span className="avatar-initials is-lg">{initials}</span>
                 )}
