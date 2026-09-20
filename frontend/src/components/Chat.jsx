@@ -82,10 +82,12 @@ export default function Chat() {
   const [answerStyle, setAnswerStyle] = useState('short and crisp');
   const [styleOpen, setStyleOpen] = useState(false);
   const [processing, setProcessing] = useState(false);
+  const [session, setSession] = useState(null);
   const chatEndRef = useRef(null);
   const fileInputRef = useRef(null);
-  const conversationIdRef = useRef(makeId());
+  const sessionIdRef = useRef(location.state?.sessionId || location.state?.conversationId || makeId());
   const messagesRef = useRef(messages);
+  const answerStyleRef = useRef(answerStyle);
   const finalizedRef = useRef(false);
 
   useEffect(() => {
@@ -93,13 +95,24 @@ export default function Chat() {
   }, [messages]);
 
   useEffect(() => {
-    const conversationId = location.state?.conversationId;
-    if (!conversationId || conversationId === conversationIdRef.current) return;
+    answerStyleRef.current = answerStyle;
+  }, [answerStyle]);
 
+  useEffect(() => {
     const loadConversation = async () => {
       try {
-        const response = await axios.get(`/user/conversations/${conversationId}`);
-        conversationIdRef.current = conversationId;
+        const requestedSessionId = location.state?.sessionId || location.state?.conversationId;
+        if (!requestedSessionId) {
+          const created = await axios.post('/user/sessions', {
+            session_id: sessionIdRef.current,
+            model_settings: { answer_style: answerStyleRef.current },
+          });
+          setSession(created.data);
+          return;
+        }
+        sessionIdRef.current = requestedSessionId;
+        const response = await axios.get(`/user/sessions/${requestedSessionId}`);
+        setSession(response.data);
         finalizedRef.current = false;
         const savedFiles = (response.data.files || []).map((file) => ({
           id: makeId(),
@@ -109,52 +122,51 @@ export default function Chat() {
           files: [{ name: file.name || file, size: null }],
           timestamp: file.timestamp || new Date().toISOString(),
         }));
-        const savedMessages = response.data.messages.flatMap((item) => [
-          {
-            id: `${item.id}-question`,
-            role: 'user',
-            kind: 'text',
-            text: item.question_utilisateur,
-            timestamp: item.date_message,
-          },
-          {
-            id: `${item.id}-answer`,
-            role: 'assistant',
-            kind: 'text',
-            text: item.reponse_llm,
-            sources: item.nom_fichier
-              ? [{ fichier: item.nom_fichier, page: item.numero_page || 1 }]
-              : [],
-            timestamp: item.date_message,
-          },
-        ]);
+        const savedMessages = response.data.messages.map((item) => ({
+          id: item.id,
+          role: item.role,
+          kind: 'text',
+          text: item.content,
+          sources: item.source_file
+            ? [{ fichier: item.source_file, page: item.source_page || 1 }]
+            : [],
+          timestamp: item.created_at,
+        }));
         setMessages([...savedFiles, ...savedMessages].sort(
           (first, second) => new Date(first.timestamp) - new Date(second.timestamp)
         ));
-      } catch {
-        setMessages([{ id: makeId(), role: 'assistant', kind: 'text', text: 'Could not load that conversation.', timestamp: new Date().toISOString() }]);
+      } catch (error) {
+        setMessages([]);
+        console.error('Could not load session', error);
       }
     };
 
     loadConversation();
-  }, [location.state?.conversationId]);
+  }, [location.state?.sessionId, location.state?.conversationId]);
 
   useEffect(() => {
     const finishConversation = async (event) => {
       const startNew = event.detail?.startNew;
       const onComplete = event.detail?.onComplete;
 
-      const resetForNewConversation = () => {
+      const resetForNewConversation = async () => {
         if (startNew) {
-          conversationIdRef.current = makeId();
+          sessionIdRef.current = makeId();
           finalizedRef.current = false;
           setMessages([]);
+          const created = await axios.post('/user/sessions', {
+            session_id: sessionIdRef.current,
+            model_settings: { answer_style: answerStyleRef.current },
+          });
+          setSession(created.data);
+          onComplete?.(created.data);
+          return;
         }
         onComplete?.();
       };
 
       if (finalizedRef.current || messagesRef.current.length === 0) {
-        resetForNewConversation();
+        await resetForNewConversation();
         return;
       }
 
@@ -182,11 +194,11 @@ export default function Chat() {
       finalizedRef.current = true;
       try {
         await axios.post('/user/conversations/finalize', {
-          conversation_id: conversationIdRef.current,
+          session_id: sessionIdRef.current,
           exchanges,
           files,
         });
-        resetForNewConversation();
+        await resetForNewConversation();
       } catch (err) {
         finalizedRef.current = false;
         console.error('Could not save conversation', err);
@@ -222,6 +234,7 @@ export default function Chat() {
 
     try {
       await axios.post('/files/upload', formData, {
+        params: { session_id: sessionIdRef.current },
         headers: { 'Content-Type': 'multipart/form-data' },
       });
       setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: 'uploaded' } : m)));
@@ -268,7 +281,7 @@ export default function Chat() {
     try {
       const response = await axios.post('/ask', {
         question: text,
-        conversation_id: conversationIdRef.current,
+        session_id: sessionIdRef.current,
         answer_style: answerStyle,
         filter_dict: null,
       });
@@ -307,7 +320,7 @@ export default function Chat() {
           <div className="chat-header-info">
             <span className="chat-avatar assistant-avatar">A</span>
             <div>
-              <p className="chat-header-name">Alex</p>
+              <p className="chat-header-name">{session?.title || 'New conversation'}</p>
               <p className="chat-header-status">
                 <span className="status-dot" />
                 {processing ? 'typing…' : 'online'}

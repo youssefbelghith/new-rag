@@ -3,17 +3,16 @@ import tempfile
 import time
 from typing import List, Optional, Dict
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, EmailStr, Field
 
 # Existing DB utilities (unchanged)
 from db_utils import (
-    create_user, authenticate_user,
-    save_qa_history, get_user_info, get_user_history,
-    get_user_conversations, get_conversation, get_conversation_files,
-    save_conversation, ensure_history_schema
+    create_user, authenticate_user, get_user_info, ensure_history_schema, create_chat_session,
+    get_chat_sessions, get_chat_session, update_chat_session,
+    delete_chat_session, get_chat_session_detail, save_chat_messages
 )
 
 # RAG logic (rewritten without Streamlit)
@@ -59,7 +58,7 @@ class Token(BaseModel):
 
 class AskRequest(BaseModel):
     question: str
-    conversation_id: Optional[str] = None
+    session_id: str
     filter_dict: Optional[Dict] = None
     answer_style: str = "short and crisp"
 
@@ -81,13 +80,22 @@ class ConversationFile(BaseModel):
     timestamp: Optional[str] = None
 
 class ConversationSaveRequest(BaseModel):
-    conversation_id: str
+    session_id: str
     exchanges: List[ConversationExchange] = Field(default_factory=list)
     files: List[ConversationFile] = Field(default_factory=list)
 
+class SessionCreateRequest(BaseModel):
+    title: str = "New conversation"
+    model_settings: Dict = Field(default_factory=dict)
+    session_id: Optional[str] = None
+
+class SessionUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    model_settings: Optional[Dict] = None
+
 # ========== IN‑MEMORY STORAGE (per user) ==========
 # structure: user_id -> {"vectordb": Chroma, "files": List[str]}
-USER_VECTORSTORES: Dict[int, Dict] = {}
+USER_VECTORSTORES: Dict[tuple, Dict] = {}
 
 # ========== AUTH HELPERS ==========
 def create_access_token(data: dict, expires_delta: timedelta = None):
@@ -173,15 +181,45 @@ async def user_info(user_id: int = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="User not found")
     return info
 
-@app.get("/user/history")
-async def user_history(user_id: int = Depends(get_current_user), limit: int = 100):
-    """Get user Q&A history."""
-    history = get_user_history(user_id, limit=limit)
-    return history
-
 @app.get("/user/conversations")
 async def user_conversations(user_id: int = Depends(get_current_user), limit: int = 100):
-    return get_user_conversations(user_id, limit=limit)
+    return get_chat_sessions(user_id, limit=limit)
+
+@app.post("/user/sessions")
+async def create_session(
+    request: SessionCreateRequest,
+    user_id: int = Depends(get_current_user)
+):
+    return create_chat_session(user_id, request.title, request.model_settings, request.session_id)
+
+@app.get("/user/sessions")
+async def list_sessions(user_id: int = Depends(get_current_user), limit: int = Query(100, ge=1, le=500)):
+    return get_chat_sessions(user_id, limit=limit)
+
+@app.patch("/user/sessions/{session_id}")
+async def edit_session(
+    session_id: str,
+    request: SessionUpdateRequest,
+    user_id: int = Depends(get_current_user)
+):
+    session = update_chat_session(user_id, session_id, request.title, request.model_settings)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
+
+@app.get("/user/sessions/{session_id}")
+async def session_detail(session_id: str, user_id: int = Depends(get_current_user)):
+    session = get_chat_session_detail(user_id, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
+
+@app.delete("/user/sessions/{session_id}")
+async def remove_session(session_id: str, user_id: int = Depends(get_current_user)):
+    if not delete_chat_session(user_id, session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    USER_VECTORSTORES.pop((user_id, session_id), None)
+    return {"message": "Session deleted"}
 
 @app.post("/user/conversations/finalize")
 async def finalize_conversation(
@@ -190,12 +228,13 @@ async def finalize_conversation(
 ):
     if not request.exchanges and not request.files:
         return {"message": "Nothing to save"}
-    save_conversation(
+    if not save_chat_messages(
         user_id=user_id,
-        conversation_id=request.conversation_id,
+        session_id=request.session_id,
         exchanges=[exchange.model_dump() for exchange in request.exchanges],
-        files=request.files,
-    )
+        files=[file.model_dump() for file in request.files],
+    ):
+        raise HTTPException(status_code=404, detail="Session not found")
     return {"message": "Conversation saved"}
 
 @app.get("/user/conversations/{conversation_id}")
@@ -203,14 +242,15 @@ async def conversation(
     conversation_id: str,
     user_id: int = Depends(get_current_user)
 ):
-    messages = get_conversation(user_id, conversation_id)
-    if not messages:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    return {"messages": messages, "files": get_conversation_files(user_id, conversation_id)}
+    session = get_chat_session_detail(user_id, conversation_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
 
 @app.post("/files/upload")
 async def upload_files(
     files: List[UploadFile] = File(...),
+    session_id: str = Query(...),
     user_id: int = Depends(get_current_user)
 ):
     """Process uploaded files and add to the user's vectorstore."""
@@ -224,12 +264,16 @@ async def upload_files(
         file_bytes_list.append((file.filename, content))
 
     # Get or create user's vectorstore
-    user_store = USER_VECTORSTORES.get(user_id)
+    if not get_chat_session(user_id, session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    store_key = (user_id, session_id)
+    user_store = USER_VECTORSTORES.get(store_key)
     if user_store is None:
         # First upload – build a new vectorstore from all files
         vectordb = build_vectorstore_from_files(file_bytes_list)
         processed_files = [name for name, _ in file_bytes_list]
-        USER_VECTORSTORES[user_id] = {
+        USER_VECTORSTORES[store_key] = {
             "vectordb": vectordb,
             "files": processed_files
         }
@@ -247,7 +291,7 @@ async def upload_files(
             fake_file = FakeUploadFile(name, content)
             vectordb = add_single_file_to_vectorstore(fake_file, vectordb)
             user_store["files"].append(name)
-        USER_VECTORSTORES[user_id]["vectordb"] = vectordb
+        USER_VECTORSTORES[store_key]["vectordb"] = vectordb
 
     return {"message": "Files processed successfully", "processed_files": [name for name, _ in file_bytes_list]}
 
@@ -257,7 +301,10 @@ async def ask_question(
     user_id: int = Depends(get_current_user)
 ):
     """Answer normally, or use the user's uploaded documents when available."""
-    user_store = USER_VECTORSTORES.get(user_id)
+    if not get_chat_session(user_id, request.session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    user_store = USER_VECTORSTORES.get((user_id, request.session_id))
     if user_store and user_store["vectordb"] is not None:
         vectordb = user_store["vectordb"]
         filter_dict = request.filter_dict

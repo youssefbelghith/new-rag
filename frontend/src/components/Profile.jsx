@@ -5,27 +5,46 @@ import { useAuth } from '../context/AuthContext';
 
 const MAX_AVATAR_BYTES = 5 * 1024 * 1024; // 5MB
 
+const EditIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M12 20h9" />
+    <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 4Z" />
+  </svg>
+);
+
+const TrashIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M3 6h18" />
+    <path d="M8 6V4h8v2" />
+    <path d="M19 6l-1 14H6L5 6" />
+    <path d="M10 11v5M14 11v5" />
+  </svg>
+);
+
 export default function Profile() {
   const { user, updateAvatar } = useAuth();
   const navigate = useNavigate();
   const [info, setInfo] = useState(null);
-  const [history, setHistory] = useState([]);
   const [conversations, setConversations] = useState([]);
   const [search, setSearch] = useState('');
+  const [editingSessionId, setEditingSessionId] = useState(null);
+  const [editingTitle, setEditingTitle] = useState('');
+  const [sessionPendingDeletion, setSessionPendingDeletion] = useState(null);
+  const [deletingSession, setDeletingSession] = useState(false);
   const [avatarError, setAvatarError] = useState('');
   const [avatarSaving, setAvatarSaving] = useState(false);
   const avatarInputRef = useRef(null);
+  const titleInputRef = useRef(null);
+  const skipRenameBlurRef = useRef(false);
 
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const [infoRes, historyRes, conversationsRes] = await Promise.all([
+        const [infoRes, conversationsRes] = await Promise.all([
           axios.get('/user/info'),
-          axios.get('/user/history?limit=100'),
           axios.get('/user/conversations?limit=100'),
         ]);
         setInfo(infoRes.data);
-        setHistory(historyRes.data);
         setConversations(conversationsRes.data);
       } catch (err) {
         console.error(err);
@@ -33,6 +52,68 @@ export default function Profile() {
     };
     fetchData();
   }, []);
+
+  useEffect(() => {
+    if (editingSessionId !== null) {
+      titleInputRef.current?.focus();
+      titleInputRef.current?.select();
+    }
+  }, [editingSessionId]);
+
+  const startRenaming = (session) => {
+    skipRenameBlurRef.current = false;
+    setEditingSessionId(session.id);
+    setEditingTitle(session.title || '');
+  };
+
+  const cancelRenaming = (session) => {
+    setEditingSessionId(null);
+    setEditingTitle(session.title || '');
+  };
+
+  const saveRenaming = async (session) => {
+    if (skipRenameBlurRef.current) {
+      skipRenameBlurRef.current = false;
+      return;
+    }
+    const title = editingTitle.trim();
+    if (!title || title === session.title) {
+      cancelRenaming(session);
+      return;
+    }
+
+    try {
+      const response = await axios.patch(`/user/sessions/${session.id}`, { title });
+      setConversations((current) => current.map((item) => item.id === session.id ? response.data : item));
+    } catch (error) {
+      console.error('Could not rename session', error);
+    } finally {
+      setEditingSessionId(null);
+    }
+  };
+
+  const requestSessionDeletion = (session) => {
+    setSessionPendingDeletion(session);
+  };
+
+  const cancelSessionDeletion = () => {
+    if (deletingSession) return;
+    setSessionPendingDeletion(null);
+  };
+
+  const confirmSessionDeletion = async () => {
+    if (!sessionPendingDeletion || deletingSession) return;
+    setDeletingSession(true);
+    try {
+      await axios.delete(`/user/sessions/${sessionPendingDeletion.id}`);
+      setConversations((current) => current.filter((item) => item.id !== sessionPendingDeletion.id));
+      setSessionPendingDeletion(null);
+    } catch (error) {
+      console.error('Could not delete session', error);
+    } finally {
+      setDeletingSession(false);
+    }
+  };
 
   const initials =
     ((info?.prenom?.[0] || user?.prenom?.[0] || '') + (info?.nom?.[0] || user?.email?.[0] || ''))
@@ -133,7 +214,8 @@ export default function Profile() {
 
         <div className="profile-section-head">
           <h2 className="profile-section-title">Conversation history</h2>
-          {history.length > 0 && (
+          <div className="history-actions">
+          {conversations.length > 0 && (
             <input
               type="text"
               value={search}
@@ -142,6 +224,7 @@ export default function Profile() {
               className="history-search"
             />
           )}
+          </div>
         </div>
 
         {conversations.length === 0 ? (
@@ -153,26 +236,106 @@ export default function Profile() {
         ) : (
             <div className="history-list">
             {filteredHistory.map((h) => (
-              <button
-                type="button"
-                key={h.conversation_id}
+              <div
+                key={h.id}
                 className="history-item"
-                onClick={() => navigate('/chat', { state: { conversationId: h.conversation_id } })}
+                role="button"
+                tabIndex={0}
+                onClick={() => navigate('/chat', { state: { sessionId: h.id } })}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    navigate('/chat', { state: { sessionId: h.id } });
+                  }
+                }}
               >
                 <div className="history-q-row">
                   <span className="history-q-mark">“</span>
-                  <p className="history-question">{h.title || 'Conversation'}</p>
+                  {editingSessionId === h.id ? (
+                    <input
+                      ref={titleInputRef}
+                      className="history-title-input"
+                      type="text"
+                      value={editingTitle}
+                      onChange={(event) => setEditingTitle(event.target.value)}
+                      onBlur={() => saveRenaming(h)}
+                      onClick={(event) => event.stopPropagation()}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          event.currentTarget.blur();
+                        }
+                        if (event.key === 'Escape') {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          skipRenameBlurRef.current = true;
+                          cancelRenaming(h);
+                        }
+                      }}
+                      aria-label="Session title"
+                    />
+                  ) : (
+                    <p className="history-question">{h.title || 'Conversation'}</p>
+                  )}
                 </div>
                 <p className="history-meta">
-                  {h.message_count} {h.message_count === 1 ? 'exchange' : 'exchanges'}
+                  {Math.floor((h.message_count || 0) / 2)} exchanges
                   {' · '}
-                  {new Date(h.date_message).toLocaleString()}
+                  {new Date(h.updated_at || h.date_message).toLocaleString()}
                 </p>
-              </button>
+                <div className="history-item-actions">
+                  <button
+                    type="button"
+                    className="history-action-btn"
+                    onClick={(event) => { event.stopPropagation(); startRenaming(h); }}
+                    aria-label={`Rename ${h.title || 'conversation'}`}
+                    title="Rename session"
+                  >
+                    <EditIcon />
+                    <span>Rename</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="history-action-btn is-danger"
+                    onClick={(event) => { event.stopPropagation(); requestSessionDeletion(h); }}
+                    aria-label={`Delete ${h.title || 'conversation'}`}
+                    title="Delete session"
+                  >
+                    <TrashIcon />
+                    <span>Delete</span>
+                  </button>
+                </div>
+              </div>
             ))}
           </div>
         )}
       </div>
+      {sessionPendingDeletion && (
+        <div
+          className="delete-modal-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) cancelSessionDeletion();
+          }}
+        >
+          <div className="delete-modal" role="dialog" aria-modal="true" aria-labelledby="delete-session-title">
+            <div className="delete-modal-icon"><TrashIcon /></div>
+            <h2 id="delete-session-title">Delete session?</h2>
+            <p>
+              This will permanently delete <strong>{sessionPendingDeletion.title || 'this session'}</strong> and its messages.
+            </p>
+            <div className="delete-modal-actions">
+              <button type="button" className="modal-cancel-btn" onClick={cancelSessionDeletion} disabled={deletingSession}>
+                Cancel
+              </button>
+              <button type="button" className="modal-delete-btn" onClick={confirmSessionDeletion} disabled={deletingSession}>
+                {deletingSession ? 'Deleting…' : 'Delete'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

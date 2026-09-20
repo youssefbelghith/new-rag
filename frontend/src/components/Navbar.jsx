@@ -42,7 +42,10 @@ export default function Navbar() {
     window.dispatchEvent(new CustomEvent('chat:finish', {
       detail: {
         startNew: true,
-        onComplete: () => navigate('/chat'),
+        onComplete: (createdSession) => navigate('/chat', {
+          replace: true,
+          state: { sessionId: createdSession?.id },
+        }),
       },
     }));
   };
