@@ -102,14 +102,7 @@ export default function Chat() {
     const loadConversation = async () => {
       try {
         const requestedSessionId = location.state?.sessionId || location.state?.conversationId;
-        if (!requestedSessionId) {
-          const created = await axios.post('/user/sessions', {
-            session_id: sessionIdRef.current,
-            model_settings: { answer_style: answerStyleRef.current },
-          });
-          setSession(created.data);
-          return;
-        }
+        if (!requestedSessionId) return;
         sessionIdRef.current = requestedSessionId;
         const response = await axios.get(`/user/sessions/${requestedSessionId}`);
         setSession(response.data);
@@ -154,13 +147,7 @@ export default function Chat() {
           sessionIdRef.current = makeId();
           finalizedRef.current = false;
           setMessages([]);
-          const created = await axios.post('/user/sessions', {
-            session_id: sessionIdRef.current,
-            model_settings: { answer_style: answerStyleRef.current },
-          });
-          setSession(created.data);
-          onComplete?.(created.data);
-          return;
+          setSession(null);
         }
         onComplete?.();
       };
@@ -279,6 +266,13 @@ export default function Chat() {
     setProcessing(true);
 
     try {
+      if (!session) {
+        const created = await axios.post('/user/sessions', {
+          session_id: sessionIdRef.current,
+          model_settings: { answer_style: answerStyleRef.current },
+        });
+        setSession(created.data);
+      }
       const response = await axios.post('/ask', {
         question: text,
         session_id: sessionIdRef.current,

@@ -264,9 +264,6 @@ async def upload_files(
         file_bytes_list.append((file.filename, content))
 
     # Get or create user's vectorstore
-    if not get_chat_session(user_id, session_id):
-        raise HTTPException(status_code=404, detail="Session not found")
-
     store_key = (user_id, session_id)
     user_store = USER_VECTORSTORES.get(store_key)
     if user_store is None:

@@ -50,6 +50,14 @@ def ensure_history_schema():
                 "ALTER TABLE conversation_files ADD COLUMN file_timestamp VARCHAR(40) NULL"
             )
         cursor.execute("DROP TABLE IF EXISTS historique")
+        cursor.execute(
+            "DELETE FROM conversation_files WHERE conversation_id NOT IN "
+            "(SELECT id FROM chat_sessions)"
+        )
+        cursor.execute(
+            "DELETE FROM chat_sessions WHERE id NOT IN "
+            "(SELECT DISTINCT session_id FROM chat_messages)"
+        )
         conn.commit()
     finally:
         cursor.close()
@@ -116,7 +124,8 @@ def get_chat_sessions(user_id, limit=100):
             "SELECT s.id, s.title, s.model_settings, s.created_at, s.updated_at, "
             "COUNT(m.id) AS message_count "
             "FROM chat_sessions s LEFT JOIN chat_messages m ON m.session_id = s.id "
-            "WHERE s.user_id = %s GROUP BY s.id ORDER BY s.updated_at DESC LIMIT %s",
+            "WHERE s.user_id = %s GROUP BY s.id "
+            "HAVING COUNT(m.id) > 0 ORDER BY s.updated_at DESC LIMIT %s",
             (user_id, limit)
         )
         return cursor.fetchall()

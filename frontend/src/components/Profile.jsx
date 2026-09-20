@@ -45,7 +45,7 @@ export default function Profile() {
           axios.get('/user/conversations?limit=100'),
         ]);
         setInfo(infoRes.data);
-        setConversations(conversationsRes.data);
+        setConversations(conversationsRes.data.filter((session) => Number(session.message_count) > 0));
       } catch (err) {
         console.error(err);
       }
