@@ -5,5 +5,5 @@ uvicorn main:app --reload --port 8000
 
 #run frontend
 
-cd C:\Users\Admin\Documents\GitHub\RAG\frontend
+cd C:\Users\Admin\Documents\GitHub\new-rag\frontend
 npm run dev
