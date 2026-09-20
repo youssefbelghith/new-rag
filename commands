@@ -1,0 +1,9 @@
+
+#run FastAPI
+cd backend
+uvicorn main:app --reload --port 8000
+
+#run frontend
+
+cd C:\Users\Admin\Documents\GitHub\RAG\frontend
+npm run dev
