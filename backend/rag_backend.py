@@ -19,42 +19,52 @@ os.environ["CHROMA_TELEMETRY"] = "False"
 MODEL_NAME = "llama3"
 PERSIST_DIR = "./chroma_db"
 
-FACTUAL_PROMPT = ChatPromptTemplate.from_template(
-    """Vous êtes un assistant précis qui répond aux questions en se basant uniquement sur le document fourni.
-Répondez dans la même langue que la question.
-Si la réponse n’est pas explicitement présente dans le document, indiquez :
-« Je ne vois pas cela clairement dans le document. »
-L’utilisateur préfère des réponses de style : {answer_style}.
-Contexte :
+LANGUAGE_POLICY = """
+Response language policy (highest priority):
+1. If the user explicitly requests a response language in the question, follow that request.
+2. Otherwise, identify the primary language of the user's question and respond entirely in that language.
+3. The language of the document or retrieved context must never determine the response language.
+Read and extract facts from the document in its original language when necessary, then translate and explain those facts in the required response language.
+Do not mention this policy unless the user asks about it.
+"""
+
+FACTUAL_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """You are a precise assistant. Answer using only the supplied document context.
+{language_policy}
+If the answer is not explicitly present in the document, say so clearly in the required response language.
+The user's preferred answer style is: {answer_style}."""),
+    ("human", """Document context:
 {context}
-Question :
+
+User question:
 {question}
-Réponse :
-"""
-)
 
-SUMMARY_PROMPT = ChatPromptTemplate.from_template(
-    """Vous êtes un assistant utile spécialisé dans la synthèse et l’extraction de conclusions à partir de documents.
+Answer:"""),
+])
 
-En utilisant TOUS les extraits fournis, produisez un résumé ou une réponse courte, concise et cohérente qui synthétise les informations essentielles.
-Répondez dans la même langue que la question.
-L’utilisateur préfère des réponses de style : {answer_style}.
-Contexte :
+SUMMARY_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """You are a helpful assistant specialized in summarizing and extracting conclusions from documents.
+{language_policy}
+Use all supplied excerpts to produce a concise, coherent summary or answer.
+The user's preferred answer style is: {answer_style}."""),
+    ("human", """Document context:
 {context}
-Question :
-{question}
-Réponse :
-"""
-)
 
-GENERAL_CHAT_PROMPT = ChatPromptTemplate.from_template(
-    """Vous êtes un assistant conversationnel utile.
-Répondez dans la même langue que la question, avec un style : {answer_style}.
-Question :
+User question:
 {question}
-Réponse :
-"""
-)
+
+Answer:"""),
+])
+
+GENERAL_CHAT_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """You are a helpful conversational assistant.
+{language_policy}
+Respond using the user's preferred answer style: {answer_style}."""),
+    ("human", """User question:
+{question}
+
+Answer:"""),
+])
 
 def get_closest_sources(answer: str, vectorstore, embeddings, k: int = 3):
     """Return unique source metadata (file, page) for the top‑k chunks most similar to the generated answer."""
@@ -194,6 +204,7 @@ def answer_general_question(question: str, answer_style: str = "short and crisp"
     prompt = GENERAL_CHAT_PROMPT.format(
         question=question,
         answer_style=answer_style,
+        language_policy=LANGUAGE_POLICY,
     )
     return get_llm().invoke(prompt).content
 
@@ -270,6 +281,7 @@ def make_rag_chain(vectordb, k: int = None, answer_style: str = "short and crisp
                 context=x["context"],
                 question=x["question"],
                 answer_style=x["answer_style"],
+                language_policy=LANGUAGE_POLICY,
             )
         )
         | RunnablePassthrough.assign(
