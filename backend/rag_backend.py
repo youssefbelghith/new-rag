@@ -1,9 +1,12 @@
 import os
+import re
 import tempfile
 import time
 import chromadb
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional, Tuple
 from functools import lru_cache
+from uuid import uuid4
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
@@ -18,6 +21,8 @@ os.environ["CHROMA_TELEMETRY"] = "False"
 
 MODEL_NAME = "llama3"
 PERSIST_DIR = "./chroma_db"
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 150
 
 LANGUAGE_POLICY = """
 Response language policy (highest priority):
@@ -89,45 +94,96 @@ def _is_summary_query(question: str) -> bool:
     return any(kw in question.lower() for kw in keywords)
 
 # ========== CHUNKING & VECTORSTORE ==========
-def build_vectorstore_from_files(file_bytes_list: List[Tuple[str, bytes]]):
-    """Build a new vectorstore from a list of (filename, file_bytes) tuples."""
-    if not file_bytes_list:
-        raise ValueError("No files given.")
+def _load_file_documents(file_data: Tuple[str, bytes, str]):
+    """Extract page documents and file-level metadata for one uploaded file."""
+    name, content, document_id = file_data
+    extension = name.rsplit(".", 1)[-1].lower()
+    if extension not in ["pdf", "md", "markdown"]:
+        return document_id, name, []
 
-    tous_les_chunks = []
-
-    for name, content in file_bytes_list:
-        extension = name.split(".")[-1].lower()
-        if extension not in ["pdf", "md", "markdown"]:
-            continue
-
-        # Write bytes to a temporary file for the loader
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{extension}")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{extension}")
+    try:
         tmp.write(content)
         tmp.close()
-
+        if extension == "pdf":
+            documents = PyPDFLoader(tmp.name).load()
+        else:
+            documents = [Document(
+                page_content=content.decode("utf-8-sig", errors="replace"),
+                metadata={"page": 0},
+            )]
+    finally:
         try:
-            if extension == "pdf":
-                loader = PyPDFLoader(tmp.name)
-                docs = loader.load()
-            else:
-                docs = [Document(
-                    page_content=content.decode("utf-8-sig", errors="replace"),
-                    metadata={"source": name},
-                )]
+            tmp.close()
         finally:
             os.unlink(tmp.name)
 
-        if not docs:
-            continue
+    return document_id, name, documents
 
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-        chunks = splitter.split_documents(docs)
 
-        for chunk in chunks:
-            chunk.metadata["source"] = name
+def _chunk_documents(document_id: str, file_name: str, documents: List[Document]):
+    """Split pages and apply the canonical metadata schema to every chunk."""
+    chunks = []
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        add_start_index=True,
+    )
+    for page_document in documents:
+        chunks.extend(splitter.split_documents([page_document]))
 
-        tous_les_chunks.extend(chunks)
+    tagged_chunks = []
+    for chunk_index, chunk in enumerate(chunks):
+        page_number = int(chunk.metadata.get("page", 0)) + 1
+        creation_date = (
+            chunk.metadata.get("creation_date")
+            or chunk.metadata.get("creationDate")
+            or chunk.metadata.get("creationdate")
+            or ""
+        )
+        chunk.metadata.update({
+            "document_id": document_id,
+            "file_name": file_name,
+            "page_number": page_number,
+            "chunk_id": f"{document_id}:{chunk_index}",
+            "chunk_index": chunk_index,
+            "creation_date": creation_date,
+            "source": file_name,
+            "page": page_number - 1,
+        })
+        tagged_chunks.append(chunk)
+    return tagged_chunks
+
+
+def _parse_and_chunk_files(file_bytes_list: List[Tuple[str, bytes]]):
+    """Parse files concurrently, then return tagged chunks and document metadata."""
+    file_data = [(name, content, str(uuid4())) for name, content in file_bytes_list]
+    with ThreadPoolExecutor(max_workers=min(4, len(file_data))) as executor:
+        extracted_files = list(executor.map(_load_file_documents, file_data))
+
+    all_chunks = []
+    document_records = []
+    for document_id, file_name, documents in extracted_files:
+        chunks = _chunk_documents(document_id, file_name, documents)
+        all_chunks.extend(chunks)
+        document_records.append({
+            "document_id": document_id,
+            "file_name": file_name,
+            "creation_date": next((
+                chunk.metadata["creation_date"] for chunk in chunks
+                if chunk.metadata["creation_date"]
+            ), ""),
+            "chunk_count": len(chunks),
+        })
+    return all_chunks, document_records
+
+
+def build_vectorstore_from_files(file_bytes_list: List[Tuple[str, bytes]]):
+    """Build a vectorstore from multiple files with tagged, filterable chunks."""
+    if not file_bytes_list:
+        raise ValueError("No files given.")
+
+    tous_les_chunks, document_records = _parse_and_chunk_files(file_bytes_list)
 
     if not tous_les_chunks:
         raise ValueError("No chunks could be extracted.")
@@ -144,49 +200,52 @@ def build_vectorstore_from_files(file_bytes_list: List[Tuple[str, bytes]]):
 
     try:
         setattr(vectordb, "_n_chunks", len(tous_les_chunks))
+        setattr(vectordb, "_documents", document_records)
     except Exception:
         pass
 
     return vectordb
 
-def add_single_file_to_vectorstore(uploaded_file, vectordb):
-    """Add a single file (must have .name and .read()) to the existing vectorstore."""
+def add_single_file_to_vectorstore(uploaded_file, vectordb, document_id=None):
+    """Add one uploaded file with the same metadata contract as batch ingestion."""
     name = uploaded_file.name
-    extension = name.split(".")[-1].lower()
-    if extension not in ["pdf", "md", "markdown"]:
-        return vectordb
-
     content = uploaded_file.read()
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{extension}")
-    tmp.write(content)
-    tmp.close()
-
-    try:
-        if extension == "pdf":
-            loader = PyPDFLoader(tmp.name)
-            docs = loader.load()
-        else:
-            docs = [Document(
-                page_content=content.decode("utf-8-sig", errors="replace"),
-                metadata={"source": name},
-            )]
-    finally:
-        os.unlink(tmp.name)
-
-    if not docs:
+    document_id = document_id or str(uuid4())
+    _, _, documents = _load_file_documents((name, content, document_id))
+    chunks = _chunk_documents(document_id, name, documents)
+    if not chunks:
         return vectordb
-
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150, add_start_index=True)
-    chunks = splitter.split_documents(docs)
-
-    for chunk in chunks:
-        chunk.metadata["source"] = name
 
     vectordb.add_documents(documents=chunks)
     n_actuel = getattr(vectordb, "_n_chunks", 0)
     setattr(vectordb, "_n_chunks", n_actuel + len(chunks))
+    documents = getattr(vectordb, "_documents", [])
+    documents.append({
+        "document_id": document_id,
+        "file_name": name,
+        "creation_date": next((
+            chunk.metadata["creation_date"] for chunk in chunks
+            if chunk.metadata["creation_date"]
+        ), ""),
+        "chunk_count": len(chunks),
+    })
+    setattr(vectordb, "_documents", documents)
 
     return vectordb
+
+
+def add_files_to_vectorstore(file_bytes_list: List[Tuple[str, bytes]], vectordb):
+    """Parse and add several files in one concurrent ingestion batch."""
+    chunks, document_records = _parse_and_chunk_files(file_bytes_list)
+    if not chunks:
+        return vectordb, document_records
+
+    vectordb.add_documents(documents=chunks)
+    setattr(vectordb, "_n_chunks", getattr(vectordb, "_n_chunks", 0) + len(chunks))
+    documents = getattr(vectordb, "_documents", [])
+    documents.extend(document_records)
+    setattr(vectordb, "_documents", documents)
+    return vectordb, document_records
 
 # ========== LLM & EMBEDDINGS ==========
 @lru_cache(maxsize=1)
@@ -209,7 +268,21 @@ def answer_general_question(question: str, answer_style: str = "short and crisp"
     return get_llm().invoke(prompt).content
 
 # ========== RAG CHAIN ==========
-def _build_retriever(vectordb, k: int = None, filter_dict: dict = None):
+def _build_metadata_filter(document_ids=None, filter_dict=None):
+    """Combine caller filters with an optional document-ID restriction."""
+    filters = []
+    if filter_dict:
+        filters.append(filter_dict)
+    if document_ids:
+        filters.append({"document_id": {"$in": list(document_ids)}})
+    if len(filters) == 1:
+        return filters[0]
+    if filters:
+        return {"$and": filters}
+    return None
+
+
+def _build_retriever(vectordb, k: int = None, filter_dict: dict = None, document_ids=None):
     total_chunks = getattr(vectordb, "_n_chunks", 10)
 
     if k is None:
@@ -227,13 +300,25 @@ def _build_retriever(vectordb, k: int = None, filter_dict: dict = None):
         "fetch_k": chosen_k * 4,
         "lambda_mult": 0.15,
     }
-    if filter_dict:
-        search_kwargs["filter"] = filter_dict
+    metadata_filter = _build_metadata_filter(document_ids, filter_dict)
+    if metadata_filter:
+        search_kwargs["filter"] = metadata_filter
 
     return vectordb.as_retriever(
         search_type="mmr",
         search_kwargs=search_kwargs,
     ), chosen_k
+
+
+def build_query_retriever(vectordb, k: int = None, filter_dict: dict = None, document_ids=None):
+    """Build a retriever for all active documents or selected document IDs."""
+    retriever, _ = _build_retriever(
+        vectordb,
+        k=k,
+        filter_dict=filter_dict,
+        document_ids=document_ids,
+    )
+    return retriever
 
 def build_context_from_docs(docs):
     if not docs:
@@ -242,19 +327,105 @@ def build_context_from_docs(docs):
 
 def build_sources_from_docs(docs):
     sources = []
+    seen_documents = set()
     for d in docs:
         nom_fichier = d.metadata.get("source", "Unknown")
+        document_key = d.metadata.get("document_id") or nom_fichier
+        if document_key in seen_documents:
+            continue
+        seen_documents.add(document_key)
         sources.append({
             "fichier": nom_fichier,
-            "page": d.metadata.get("page", 0) + 1,
+            "page": d.metadata.get("page_number", d.metadata.get("page", 0) + 1),
+            "document_id": d.metadata.get("document_id"),
+            "chunk_id": d.metadata.get("chunk_id"),
+            "score": d.metadata.get("relevance_score"),
         })
     return sources
 
-def make_rag_chain(vectordb, k: int = None, answer_style: str = "short and crisp", filter_dict: dict = None):
+
+def _document_key(document):
+    metadata = document.metadata
+    return metadata.get("chunk_id") or (
+        metadata.get("document_id") or metadata.get("source", "Unknown"),
+        metadata.get("page_number", metadata.get("page", 0)),
+        document.page_content,
+    )
+
+
+def _answer_uses_chunk(answer: str, chunk_text: str) -> bool:
+    """Conservative fallback for chunks used by the answer despite a low score."""
+    stop_words = {
+        "about", "after", "also", "avec", "dans", "from", "have", "into",
+        "more", "that", "than", "their", "this", "what", "which", "with",
+        "your", "pour", "plus", "sont", "une", "vous", "les", "des", "est",
+    }
+    answer_terms = {
+        term for term in re.findall(r"[\wÀ-ÿ]{4,}", answer.lower())
+        if term not in stop_words
+    }
+    chunk_terms = set(re.findall(r"[\wÀ-ÿ]{4,}", chunk_text.lower()))
+    return len(answer_terms & chunk_terms) >= 2
+
+
+def build_ui_sources(
+    question: str,
+    answer: str,
+    retrieved_docs,
+    vectorstore,
+    filter_dict: dict = None,
+    document_ids=None,
+    relevance_threshold: float = 0.65,
+):
+    """Clean citations after generation without changing the LLM context."""
+    if not retrieved_docs:
+        return []
+
+    metadata_filter = _build_metadata_filter(document_ids, filter_dict)
+    scored_docs = vectorstore.similarity_search_with_relevance_scores(
+        question,
+        k=max(20, len(retrieved_docs) * 4),
+        filter=metadata_filter,
+    )
+    score_by_chunk = {
+        _document_key(document): float(score)
+        for document, score in scored_docs
+    }
+
+    cleaned_docs = []
+    for document in retrieved_docs:
+        score = score_by_chunk.get(_document_key(document))
+        if score is not None:
+            document.metadata["relevance_score"] = round(score, 4)
+        if (
+            score is not None and score > relevance_threshold
+        ) or _answer_uses_chunk(answer, document.page_content):
+            cleaned_docs.append(document)
+
+    cleaned_docs.sort(
+        key=lambda document: document.metadata.get("relevance_score", 0),
+        reverse=True,
+    )
+    return build_sources_from_docs(cleaned_docs)
+
+def make_rag_chain(
+    vectordb,
+    k: int = None,
+    answer_style: str = "short and crisp",
+    filter_dict: dict = None,
+    document_ids=None,
+):
     """Build a LangChain Runnable that answers questions with source documents."""
-    retriever, chosen_k = _build_retriever(vectordb, k=k, filter_dict=filter_dict)
+    retriever, chosen_k = _build_retriever(
+        vectordb, k=k, filter_dict=filter_dict, document_ids=document_ids
+    )
     summary_k = k if k is not None else 20
-    summary_retriever, _ = _build_retriever(vectordb, k=summary_k, filter_dict=filter_dict)
+    summary_retriever, _ = _build_retriever(
+        vectordb,
+        k=summary_k,
+        filter_dict=filter_dict,
+        document_ids=document_ids,
+    )
 
     def retrieve_docs(question: str):
         if _is_summary_query(question):

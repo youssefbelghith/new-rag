@@ -19,11 +19,10 @@ from db_utils import (
 # RAG logic (rewritten without Streamlit)
 from rag_backend import (
     build_vectorstore_from_files,
-    add_single_file_to_vectorstore,
+    add_files_to_vectorstore,
     answer_general_question,
     make_rag_chain,
-    get_closest_sources,
-    get_embeddings
+    build_ui_sources,
 )
 
 # JWT / password hashing
@@ -83,11 +82,15 @@ class AskRequest(BaseModel):
     question: str
     session_id: str
     filter_dict: Optional[Dict] = None
+    document_ids: Optional[List[str]] = None
     answer_style: str = "short and crisp"
 
 class Source(BaseModel):
     fichier: str
     page: int
+    document_id: Optional[str] = None
+    chunk_id: Optional[str] = None
+    score: Optional[float] = None
 
 class AnswerResponse(BaseModel):
     answer: str
@@ -298,28 +301,21 @@ async def upload_files(
     if user_store is None:
         # First upload – build a new vectorstore from all files
         vectordb = build_vectorstore_from_files(file_bytes_list)
-        processed_files = [name for name, _ in file_bytes_list]
         USER_VECTORSTORES[store_key] = {
             "vectordb": vectordb,
-            "files": processed_files
+            "files": vectordb._documents,
         }
     else:
-        # Add each file individually to existing vectorstore
+        # Parse all newly uploaded files as one concurrent ingestion batch.
         vectordb = user_store["vectordb"]
-        for name, content in file_bytes_list:
-            # Create a temporary UploadFile-like object for the backend function
-            class FakeUploadFile:
-                def __init__(self, name, content):
-                    self.name = name
-                    self._content = content
-                def read(self):
-                    return self._content
-            fake_file = FakeUploadFile(name, content)
-            vectordb = add_single_file_to_vectorstore(fake_file, vectordb)
-            user_store["files"].append(name)
+        vectordb, _ = add_files_to_vectorstore(file_bytes_list, vectordb)
         USER_VECTORSTORES[store_key]["vectordb"] = vectordb
 
-    return {"message": "Files processed successfully", "processed_files": [name for name, _ in file_bytes_list]}
+    return {
+        "message": "Files processed successfully",
+        "processed_files": [name for name, _ in file_bytes_list],
+        "documents": USER_VECTORSTORES[store_key]["vectordb"]._documents,
+    }
 
 @app.post("/ask", response_model=AnswerResponse)
 async def ask_question(
@@ -338,13 +334,20 @@ async def ask_question(
         rag_chain, _, _ = make_rag_chain(
             vectordb,
             answer_style=request.answer_style,
-            filter_dict=filter_dict
+            filter_dict=filter_dict,
+            document_ids=request.document_ids,
         )
         result = rag_chain.invoke(request.question)
         answer = result["answer"]
 
-        embed_model = get_embeddings()
-        sources = get_closest_sources(answer, vectordb, embed_model, k=3)
+        sources = build_ui_sources(
+            question=request.question,
+            answer=answer,
+            retrieved_docs=result["source_documents"],
+            vectorstore=vectordb,
+            filter_dict=filter_dict,
+            document_ids=request.document_ids,
+        )
     else:
         answer = answer_general_question(
             request.question,
