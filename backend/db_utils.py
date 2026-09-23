@@ -1,7 +1,10 @@
 import mysql.connector
 import bcrypt
 import json
+import logging
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 DB_CONFIG = {
     "host": "localhost",
@@ -39,7 +42,8 @@ def ensure_history_schema():
             "CREATE TABLE IF NOT EXISTS conversation_files ("
             "id INT AUTO_INCREMENT PRIMARY KEY, "
             "user_id INT NOT NULL, conversation_id VARCHAR(36) NOT NULL, "
-            "file_name VARCHAR(255) NOT NULL, file_timestamp VARCHAR(40) NULL, "
+            "file_id VARCHAR(255) NULL, file_name VARCHAR(255) NOT NULL, "
+            "file_url TEXT NULL, file_timestamp VARCHAR(40) NULL, "
             "UNIQUE KEY unique_conversation_file (user_id, conversation_id, file_name), "
             "INDEX conversation_files_lookup (user_id, conversation_id)"
             ")"
@@ -48,6 +52,16 @@ def ensure_history_schema():
         if cursor.fetchone() is None:
             cursor.execute(
                 "ALTER TABLE conversation_files ADD COLUMN file_timestamp VARCHAR(40) NULL"
+            )
+        cursor.execute("SHOW COLUMNS FROM conversation_files LIKE 'file_id'")
+        if cursor.fetchone() is None:
+            cursor.execute(
+                "ALTER TABLE conversation_files ADD COLUMN file_id VARCHAR(255) NULL"
+            )
+        cursor.execute("SHOW COLUMNS FROM conversation_files LIKE 'file_url'")
+        if cursor.fetchone() is None:
+            cursor.execute(
+                "ALTER TABLE conversation_files ADD COLUMN file_url TEXT NULL"
             )
         cursor.execute("DROP TABLE IF EXISTS historique")
         cursor.execute("SHOW COLUMNS FROM utilisateurs LIKE 'avatar'")
@@ -221,6 +235,8 @@ def save_chat_messages(user_id, session_id, exchanges, files):
     conn = get_connection()
     try:
         cursor = conn.cursor()
+        cursor.execute("SHOW COLUMNS FROM conversation_files")
+        conversation_file_columns = {row[0] for row in cursor.fetchall()}
         for exchange in exchanges:
             sources = exchange.get("sources") or []
             source = sources[0] if sources else {}
@@ -237,20 +253,49 @@ def save_chat_messages(user_id, session_id, exchanges, files):
                     (session_id, role, content, source.get("fichier") if role == "assistant" else None,
                      source.get("page") if role == "assistant" else None)
                 )
-        for file in files:
-            file_name = file if isinstance(file, str) else file["name"]
-            file_timestamp = None if isinstance(file, str) else file.get("timestamp")
-            cursor.execute(
-                "INSERT IGNORE INTO conversation_files "
-                "(user_id, conversation_id, file_name, file_timestamp) VALUES (%s, %s, %s, %s)",
-                (user_id, session_id, file_name, file_timestamp)
-            )
+        for file in files or []:
+            if isinstance(file, str):
+                file_id = None
+                file_name = file
+                file_url = None
+                file_timestamp = None
+            else:
+                file_id = str(file.get("file_id") or file.get("id") or "") or None
+                file_name = str(file.get("file_name") or file.get("name") or "")
+                file_url = str(file.get("file_url") or file.get("url") or "") or None
+                file_timestamp = file.get("timestamp")
+            if not file_name:
+                logger.warning("Skipping attachment without a file name: %s", file)
+                continue
+            if {"file_id", "file_url"}.issubset(conversation_file_columns):
+                cursor.execute(
+                    "INSERT IGNORE INTO conversation_files "
+                    "(user_id, conversation_id, file_id, file_name, file_url, file_timestamp) "
+                    "VALUES (%s, %s, %s, %s, %s, %s)",
+                    (user_id, session_id, file_id, file_name, file_url, file_timestamp)
+                )
+            else:
+                cursor.execute(
+                    "INSERT IGNORE INTO conversation_files "
+                    "(user_id, conversation_id, file_name, file_timestamp) VALUES (%s, %s, %s, %s)",
+                    (user_id, session_id, file_name, file_timestamp)
+                )
         cursor.execute(
             "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = %s AND user_id = %s",
             (session_id, user_id)
         )
         conn.commit()
         return True
+    except Exception:
+        conn.rollback()
+        logger.exception(
+            "Failed to save session history: user_id=%s session_id=%s exchanges=%d files=%d",
+            user_id,
+            session_id,
+            len(exchanges or []),
+            len(files or []),
+        )
+        return False
     finally:
         cursor.close()
         conn.close()
@@ -259,12 +304,35 @@ def get_conversation_files(user_id, conversation_id):
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT file_name, file_timestamp FROM conversation_files "
-            "WHERE user_id = %s AND conversation_id = %s ORDER BY id ASC",
-            (user_id, conversation_id)
-        )
-        return [{"name": row[0], "timestamp": row[1]} for row in cursor.fetchall()]
+        cursor.execute("SHOW COLUMNS FROM conversation_files")
+        columns = {row[0] for row in cursor.fetchall()}
+        if {"file_id", "file_url"}.issubset(columns):
+            cursor.execute(
+                "SELECT file_id, file_name, file_url, file_timestamp FROM conversation_files "
+                "WHERE user_id = %s AND conversation_id = %s ORDER BY id ASC",
+                (user_id, conversation_id)
+            )
+        else:
+            cursor.execute(
+                "SELECT file_name, file_timestamp FROM conversation_files "
+                "WHERE user_id = %s AND conversation_id = %s ORDER BY id ASC",
+                (user_id, conversation_id)
+            )
+            return [
+                {"file_id": None, "file_name": row[0], "file_url": None,
+                 "name": row[0], "timestamp": row[1]}
+                for row in cursor.fetchall()
+            ]
+        return [
+            {
+                "file_id": row[0],
+                "file_name": row[1],
+                "file_url": row[2],
+                "name": row[1],
+                "timestamp": row[3],
+            }
+            for row in cursor.fetchall()
+        ]
     finally:
         cursor.close()
         conn.close()

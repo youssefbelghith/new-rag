@@ -3,6 +3,7 @@ import re
 import tempfile
 import time
 import chromadb
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional, Tuple
 from functools import lru_cache
@@ -23,6 +24,15 @@ MODEL_NAME = "llama3"
 PERSIST_DIR = "./chroma_db"
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
+DOCUMENT_FILTER_KEY = "document_id"
+LEGACY_DOCUMENT_FILTER_KEYS = ("file_name", "source")
+
+logger = logging.getLogger(__name__)
+
+
+def _debug_trace(message, *values):
+    """Emit retrieval diagnostics even when application INFO logs are filtered."""
+    print(message % values if values else message, flush=True)
 
 LANGUAGE_POLICY = """
 Response language policy (highest priority):
@@ -142,7 +152,7 @@ def _chunk_documents(document_id: str, file_name: str, documents: List[Document]
             or ""
         )
         chunk.metadata.update({
-            "document_id": document_id,
+            DOCUMENT_FILTER_KEY: document_id,
             "file_name": file_name,
             "page_number": page_number,
             "chunk_id": f"{document_id}:{chunk_index}",
@@ -201,9 +211,83 @@ def build_vectorstore_from_files(file_bytes_list: List[Tuple[str, bytes]]):
     try:
         setattr(vectordb, "_n_chunks", len(tous_les_chunks))
         setattr(vectordb, "_documents", document_records)
+        setattr(vectordb, "_collection_name", unique_collection_name)
     except Exception:
         pass
 
+    return vectordb
+
+
+def restore_vectorstore_for_documents(requested_ids):
+    """Recover all persisted Chroma collections matching a reopened session."""
+    if not requested_ids:
+        return None
+
+    requested = {str(value) for value in requested_ids}
+    client = chromadb.PersistentClient(path=PERSIST_DIR)
+    matching_collections = []
+    matching_documents = []
+    for collection in client.list_collections():
+        collection_name = collection.name if hasattr(collection, "name") else str(collection)
+        try:
+            raw_collection = client.get_collection(collection_name)
+            records = raw_collection.get(include=["documents", "metadatas"])
+            documents = records.get("documents") or []
+            metadatas = records.get("metadatas") or []
+            matches = []
+            for index, metadata in enumerate(metadatas):
+                if not metadata or not (
+                    str(metadata.get(DOCUMENT_FILTER_KEY, "")) in requested
+                    or str(metadata.get("file_name", "")) in requested
+                    or str(metadata.get("source", "")) in requested
+                ):
+                    continue
+                matches.append(metadata)
+                matching_documents.append(Document(
+                    page_content=documents[index] if index < len(documents) else "",
+                    metadata=metadata,
+                ))
+            if not matches:
+                continue
+            matching_collections.append(collection_name)
+            _debug_trace(
+                "[RAG DEBUG] Matched persisted collection=%s chunks=%s matched_metadata=%s",
+                collection_name,
+                len(metadatas),
+                matches[:5],
+            )
+        except Exception:
+            logger.exception("Could not inspect persisted Chroma collection %s", collection_name)
+
+    if not matching_collections:
+        return None
+    if len(matching_collections) == 1:
+        vectordb = Chroma(
+            client=client,
+            collection_name=matching_collections[0],
+            embedding_function=get_embeddings(),
+        )
+        setattr(vectordb, "_n_chunks", len(matching_documents))
+        setattr(vectordb, "_collection_name", matching_collections[0])
+        setattr(vectordb, "_documents", [document.metadata for document in matching_documents])
+        return vectordb
+
+    combined_name = f"restored_{uuid4().hex}"
+    vectordb = Chroma.from_documents(
+        documents=matching_documents,
+        embedding=get_embeddings(),
+        client=client,
+        collection_name=combined_name,
+    )
+    setattr(vectordb, "_n_chunks", len(matching_documents))
+    setattr(vectordb, "_collection_name", combined_name)
+    setattr(vectordb, "_documents", [document.metadata for document in matching_documents])
+    _debug_trace(
+        "[RAG DEBUG] Combined persisted collections=%s into=%s chunks=%s",
+        matching_collections,
+        combined_name,
+        len(matching_documents),
+    )
     return vectordb
 
 def add_single_file_to_vectorstore(uploaded_file, vectordb, document_id=None):
@@ -274,7 +358,16 @@ def _build_metadata_filter(document_ids=None, filter_dict=None):
     if filter_dict:
         filters.append(filter_dict)
     if document_ids:
-        filters.append({"document_id": {"$in": list(document_ids)}})
+        requested_values = list(document_ids)
+        filters.append({
+            "$or": [
+                {DOCUMENT_FILTER_KEY: {"$in": requested_values}},
+                *[
+                    {key: {"$in": requested_values}}
+                    for key in LEGACY_DOCUMENT_FILTER_KEYS
+                ],
+            ]
+        })
     if len(filters) == 1:
         return filters[0]
     if filters:
@@ -303,6 +396,20 @@ def _build_retriever(vectordb, k: int = None, filter_dict: dict = None, document
     metadata_filter = _build_metadata_filter(document_ids, filter_dict)
     if metadata_filter:
         search_kwargs["filter"] = metadata_filter
+    logger.info(
+        "Retriever filter: metadata_key=%s requested_document_ids=%s filter=%s k=%s",
+        DOCUMENT_FILTER_KEY,
+        document_ids,
+        metadata_filter,
+        chosen_k,
+    )
+    _debug_trace(
+        "[RAG DEBUG] Retriever filter: metadata_keys=%s requested_document_ids=%s filter=%s k=%s",
+        (DOCUMENT_FILTER_KEY, *LEGACY_DOCUMENT_FILTER_KEYS),
+        document_ids,
+        metadata_filter,
+        chosen_k,
+    )
 
     return vectordb.as_retriever(
         search_type="mmr",
@@ -324,6 +431,62 @@ def build_context_from_docs(docs):
     if not docs:
         return "No relevant context found in the document."
     return "\n\n-----\n\n".join(d.page_content for d in docs)
+
+
+def _collection_metadata_snapshot(vectordb):
+    """Return stored metadata keys and document IDs for diagnosing filter misses."""
+    try:
+        records = vectordb.get(include=["metadatas"])
+        metadatas = records.get("metadatas") or []
+        existing_ids = sorted({
+            str(metadata.get(DOCUMENT_FILTER_KEY))
+            for metadata in metadatas
+            if metadata and metadata.get(DOCUMENT_FILTER_KEY) is not None
+        })
+        metadata_keys = set()
+        for metadata in metadatas:
+            if metadata:
+                metadata_keys.update(metadata.keys())
+        keys = sorted(metadata_keys)
+        return existing_ids, keys
+    except Exception:
+        logger.exception("Could not inspect vector store metadata")
+        return [], []
+
+
+def resolve_document_ids(vectordb, requested_ids):
+    """Resolve legacy filenames or stored IDs to the canonical document_id values."""
+    if not requested_ids:
+        return None
+
+    requested = {str(value) for value in requested_ids}
+    try:
+        records = vectordb.get(include=["metadatas"])
+        resolved = {
+            str(metadata[DOCUMENT_FILTER_KEY])
+            for metadata in records.get("metadatas", [])
+            if metadata
+            and metadata.get(DOCUMENT_FILTER_KEY) is not None
+            and (
+                str(metadata.get(DOCUMENT_FILTER_KEY)) in requested
+                or str(metadata.get("file_name", "")) in requested
+                or str(metadata.get("source", "")) in requested
+            )
+        }
+        logger.info(
+            "Resolved requested file IDs: requested=%s resolved_document_ids=%s",
+            list(requested_ids),
+            sorted(resolved),
+        )
+        _debug_trace(
+            "[RAG DEBUG] Resolved requested file IDs: requested=%s resolved_document_ids=%s",
+            list(requested_ids),
+            sorted(resolved),
+        )
+        return sorted(resolved) or list(requested_ids)
+    except Exception:
+        logger.exception("Could not resolve requested file IDs against vector metadata")
+        return list(requested_ids)
 
 def build_sources_from_docs(docs):
     sources = []
@@ -428,10 +591,35 @@ def make_rag_chain(
     )
 
     def retrieve_docs(question: str):
-        if _is_summary_query(question):
-            return summary_retriever.invoke(question)
-        else:
-            return retriever.invoke(question)
+        active_retriever = summary_retriever if _is_summary_query(question) else retriever
+        retrieved_docs = active_retriever.invoke(question)
+        logger.info(
+            "Retrieved chunks before LLM: count=%s metadata=%s",
+            len(retrieved_docs),
+            [document.metadata for document in retrieved_docs],
+        )
+        _debug_trace(
+            "[RAG DEBUG] Retrieved chunks before LLM: count=%s metadata=%s",
+            len(retrieved_docs),
+            [document.metadata for document in retrieved_docs],
+        )
+        if document_ids and not retrieved_docs:
+            existing_ids, metadata_keys = _collection_metadata_snapshot(vectordb)
+            logger.warning(
+                "No chunks matched requested document IDs: requested=%s existing_%s=%s metadata_keys=%s",
+                list(document_ids),
+                DOCUMENT_FILTER_KEY,
+                existing_ids,
+                metadata_keys,
+            )
+            _debug_trace(
+                "[RAG WARNING] No chunks matched requested document IDs: requested=%s existing_%s=%s metadata_keys=%s",
+                list(document_ids),
+                DOCUMENT_FILTER_KEY,
+                existing_ids,
+                metadata_keys,
+            )
+        return retrieved_docs
 
     llm = get_llm()
     rag_chain = (

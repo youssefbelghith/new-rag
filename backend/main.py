@@ -2,6 +2,7 @@ import os
 import re
 import tempfile
 import time
+import logging
 from typing import List, Optional, Dict
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Query
@@ -13,7 +14,8 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 from db_utils import (
     create_user, authenticate_user, get_user_info, ensure_history_schema, create_chat_session,
     get_chat_sessions, get_chat_session, update_chat_session,
-    delete_chat_session, get_chat_session_detail, save_chat_messages, update_user_avatar
+    delete_chat_session, get_chat_session_detail, get_conversation_files,
+    save_chat_messages, update_user_avatar
 )
 
 # RAG logic (rewritten without Streamlit)
@@ -23,12 +25,16 @@ from rag_backend import (
     answer_general_question,
     make_rag_chain,
     build_ui_sources,
+    resolve_document_ids,
+    restore_vectorstore_for_documents,
 )
 
 # JWT / password hashing
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
 
 # ========== CONFIG ==========
 SECRET_KEY = "your-secret-key-change-in-production"
@@ -83,6 +89,7 @@ class AskRequest(BaseModel):
     session_id: str
     filter_dict: Optional[Dict] = None
     document_ids: Optional[List[str]] = None
+    file_ids: Optional[List[str]] = None
     answer_style: str = "short and crisp"
 
 class Source(BaseModel):
@@ -102,7 +109,10 @@ class ConversationExchange(BaseModel):
     sources: List[Source] = Field(default_factory=list)
 
 class ConversationFile(BaseModel):
-    name: str
+    file_id: Optional[str] = None
+    file_name: Optional[str] = None
+    file_url: Optional[str] = None
+    name: Optional[str] = None
     timestamp: Optional[str] = None
 
 class ConversationSaveRequest(BaseModel):
@@ -266,7 +276,14 @@ async def finalize_conversation(
         exchanges=[exchange.model_dump() for exchange in request.exchanges],
         files=[file.model_dump() for file in request.files],
     ):
-        raise HTTPException(status_code=404, detail="Session not found")
+        logger.error(
+            "Conversation finalization failed: user_id=%s session_id=%s exchanges=%d files=%d",
+            user_id,
+            request.session_id,
+            len(request.exchanges),
+            len(request.files),
+        )
+        raise HTTPException(status_code=500, detail="Could not save conversation history")
     return {"message": "Conversation saved"}
 
 @app.get("/user/conversations/{conversation_id}")
@@ -301,6 +318,7 @@ async def upload_files(
     if user_store is None:
         # First upload – build a new vectorstore from all files
         vectordb = build_vectorstore_from_files(file_bytes_list)
+        uploaded_documents = vectordb._documents
         USER_VECTORSTORES[store_key] = {
             "vectordb": vectordb,
             "files": vectordb._documents,
@@ -308,13 +326,14 @@ async def upload_files(
     else:
         # Parse all newly uploaded files as one concurrent ingestion batch.
         vectordb = user_store["vectordb"]
-        vectordb, _ = add_files_to_vectorstore(file_bytes_list, vectordb)
+        vectordb, uploaded_documents = add_files_to_vectorstore(file_bytes_list, vectordb)
         USER_VECTORSTORES[store_key]["vectordb"] = vectordb
 
     return {
         "message": "Files processed successfully",
         "processed_files": [name for name, _ in file_bytes_list],
-        "documents": USER_VECTORSTORES[store_key]["vectordb"]._documents,
+        "documents": uploaded_documents,
+        "active_documents": USER_VECTORSTORES[store_key]["vectordb"]._documents,
     }
 
 @app.post("/ask", response_model=AnswerResponse)
@@ -326,16 +345,63 @@ async def ask_question(
     if not get_chat_session(user_id, request.session_id):
         raise HTTPException(status_code=404, detail="Session not found")
 
-    user_store = USER_VECTORSTORES.get((user_id, request.session_id))
+    store_key = (user_id, request.session_id)
+    user_store = USER_VECTORSTORES.get(store_key)
+    logger.info(
+        "Incoming /ask file_ids=%s document_ids=%s session_id=%s",
+        request.file_ids,
+        request.document_ids,
+        request.session_id,
+    )
+    print(
+        "[RAG DEBUG] Incoming /ask file_ids=%s document_ids=%s session_id=%s"
+        % (request.file_ids, request.document_ids, request.session_id),
+        flush=True,
+    )
+    requested_file_ids = request.document_ids or request.file_ids
+    recovery_ids = list(requested_file_ids or [])
+    if requested_file_ids:
+        saved_files = get_conversation_files(user_id, request.session_id)
+        saved_file_names = {
+            str(file.get("file_name") or file.get("name"))
+            for file in saved_files
+            if str(file.get("file_id")) in {str(value) for value in requested_file_ids}
+        }
+        if not saved_file_names:
+            saved_file_names = {
+                str(file.get("file_name") or file.get("name"))
+                for file in saved_files
+                if file.get("file_name") or file.get("name")
+            }
+        recovery_ids.extend(sorted(saved_file_names))
+        print(
+            "[RAG DEBUG] Recovery IDs after session-file lookup: requested=%s candidates=%s"
+            % (requested_file_ids, recovery_ids),
+            flush=True,
+        )
+    if not user_store and recovery_ids:
+        restored_vectordb = restore_vectorstore_for_documents(recovery_ids)
+        if restored_vectordb is not None:
+            USER_VECTORSTORES[store_key] = {
+                "vectordb": restored_vectordb,
+                "files": getattr(restored_vectordb, "_documents", []),
+            }
+            user_store = USER_VECTORSTORES[store_key]
     if user_store and user_store["vectordb"] is not None:
         vectordb = user_store["vectordb"]
         filter_dict = request.filter_dict
+        active_document_ids = resolve_document_ids(vectordb, recovery_ids)
+        print(
+            "[RAG DEBUG] Requested IDs=%s resolved filter document_ids=%s"
+            % (recovery_ids, active_document_ids),
+            flush=True,
+        )
 
         rag_chain, _, _ = make_rag_chain(
             vectordb,
             answer_style=request.answer_style,
             filter_dict=filter_dict,
-            document_ids=request.document_ids,
+            document_ids=active_document_ids,
         )
         result = rag_chain.invoke(request.question)
         answer = result["answer"]
@@ -346,9 +412,21 @@ async def ask_question(
             retrieved_docs=result["source_documents"],
             vectorstore=vectordb,
             filter_dict=filter_dict,
-            document_ids=request.document_ids,
+            document_ids=active_document_ids,
         )
     else:
+        if request.file_ids or request.document_ids:
+            logger.warning(
+                "Requested document IDs but no active vectorstore exists for session: file_ids=%s document_ids=%s",
+                request.file_ids,
+                request.document_ids,
+            )
+            print(
+                "[RAG WARNING] Requested document IDs but no active vectorstore exists: "
+                "file_ids=%s document_ids=%s"
+                % (request.file_ids, request.document_ids),
+                flush=True,
+            )
         answer = answer_general_question(
             request.question,
             answer_style=request.answer_style,

@@ -83,6 +83,8 @@ export default function Chat() {
   const [styleOpen, setStyleOpen] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [session, setSession] = useState(null);
+  const [activeFileIds, setActiveFileIds] = useState([]);
+  const activeFileIdsRef = useRef([]);
   const chatEndRef = useRef(null);
   const fileInputRef = useRef(null);
   const sessionIdRef = useRef(location.state?.sessionId || location.state?.conversationId || makeId());
@@ -106,13 +108,24 @@ export default function Chat() {
         sessionIdRef.current = requestedSessionId;
         const response = await axios.get(`/user/sessions/${requestedSessionId}`);
         setSession(response.data);
+        const restoredFileIds = (response.data.files || [])
+          .map((file) => typeof file === 'string'
+            ? file
+            : (file.file_id || file.document_id || file.file_name || file.name))
+          .filter(Boolean);
+        activeFileIdsRef.current = restoredFileIds;
+        setActiveFileIds(restoredFileIds);
         finalizedRef.current = false;
         const savedFiles = (response.data.files || []).map((file) => ({
           id: makeId(),
           role: 'user',
           kind: 'files',
           status: 'uploaded',
-          files: [{ name: file.name || file, size: null }],
+          files: [{
+            name: file.file_name || file.name || file,
+            file_id: file.file_id || file.document_id || file.file_name || file.name || null,
+            size: null,
+          }],
           timestamp: file.timestamp || new Date().toISOString(),
         }));
         const savedMessages = response.data.messages.map((item) => ({
@@ -148,6 +161,8 @@ export default function Chat() {
           finalizedRef.current = false;
           setMessages([]);
           setSession(null);
+          activeFileIdsRef.current = [];
+          setActiveFileIds([]);
         }
         onComplete?.();
       };
@@ -173,8 +188,11 @@ export default function Chat() {
       }
       const files = messagesRef.current
         .filter((message) => message.kind === 'files' && message.status === 'uploaded')
-        .flatMap((message) => message.files.map((file) => ({
-          name: file.name,
+        .flatMap((message) => message.files.map((file, index) => ({
+          file_id: file.file_id || `${message.id}-${index}`,
+          file_name: file.file_name || file.name,
+          file_url: file.file_url || null,
+          name: file.file_name || file.name,
           timestamp: message.timestamp,
         })));
 
@@ -220,11 +238,26 @@ export default function Chat() {
     selected.forEach((file) => formData.append('files', file));
 
     try {
-      await axios.post('/files/upload', formData, {
+      const uploadResponse = await axios.post('/files/upload', formData, {
         params: { session_id: sessionIdRef.current },
         headers: { 'Content-Type': 'multipart/form-data' },
       });
-      setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, status: 'uploaded' } : m)));
+      const uploadedDocuments = uploadResponse.data.documents || [];
+      const uploadedFileIds = uploadedDocuments.map((document) => document.document_id).filter(Boolean);
+      activeFileIdsRef.current = [...new Set([...activeFileIdsRef.current, ...uploadedFileIds])];
+      setActiveFileIds(activeFileIdsRef.current);
+      setMessages((prev) => prev.map((message) => {
+        if (message.id !== id) return message;
+        return {
+          ...message,
+          status: 'uploaded',
+          files: message.files.map((file, index) => ({
+            ...file,
+            file_id: uploadedDocuments[index]?.document_id || file.file_id,
+            file_name: uploadedDocuments[index]?.file_name || file.name,
+          })),
+        };
+      }));
       setMessages((prev) => [
         ...prev,
         {
@@ -278,6 +311,7 @@ export default function Chat() {
         session_id: sessionIdRef.current,
         answer_style: answerStyle,
         filter_dict: null,
+        file_ids: activeFileIdsRef.current.length > 0 ? activeFileIdsRef.current : activeFileIds,
       });
       const { answer, sources } = response.data;
       setMessages((prev) => [
