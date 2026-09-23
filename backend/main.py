@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 import time
 from typing import List, Optional, Dict
@@ -6,7 +7,7 @@ from typing import List, Optional, Dict
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 # Existing DB utilities (unchanged)
 from db_utils import (
@@ -43,11 +44,30 @@ class UserCreate(BaseModel):
     nom: str
     prenom: str
     email: EmailStr
-    password: str
+    password: str = Field(min_length=8)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value):
+        if not value.strip():
+            raise ValueError("Password cannot be empty or whitespace-only")
+        if not re.search(r"[A-Za-z]", value) or not re.search(r"[0-9]", value):
+            raise ValueError("Password must contain at least one letter and one number")
+        return value
 
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, value):
+        return value.strip() if isinstance(value, str) else value
 
 class AvatarUpdate(BaseModel):
     avatar: str

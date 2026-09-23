@@ -13,22 +13,57 @@ export default function Login() {
 
   const handleChange = (e) => setFormData({ ...formData, [e.target.name]: e.target.value });
 
+  const validateForm = () => {
+    const email = formData.email.trim();
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+    if (!emailPattern.test(email)) {
+      return 'Please enter a valid email address, such as name@example.com.';
+    }
+
+    if (!formData.password.trim()) {
+      return 'Password cannot be empty.';
+    }
+
+    if (!isLogin) {
+      if (formData.password.length < 8) {
+        return 'Password must be at least 8 characters long.';
+      }
+      if (!/[A-Za-z]/.test(formData.password) || !/[0-9]/.test(formData.password)) {
+        return 'Password must contain at least one letter and one number.';
+      }
+      if (formData.password !== formData.confirmPassword) {
+        return 'Passwords do not match.';
+      }
+    }
+
+    return '';
+  };
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
+
+    const validationError = validateForm();
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
+
     setLoading(true);
     try {
       const url = isLogin ? '/login' : '/signup';
       const payload = isLogin
-        ? { email: formData.email, password: formData.password }
-        : { nom: formData.nom, prenom: formData.prenom, email: formData.email, password: formData.password };
+        ? { email: formData.email.trim(), password: formData.password }
+        : { nom: formData.nom, prenom: formData.prenom, email: formData.email.trim(), password: formData.password };
 
       const response = await axios.post(url, payload);
       const { access_token, user_id, prenom, email } = response.data;
       login(access_token, { id: user_id, prenom, email });
       navigate('/chat');
     } catch (err) {
-      setError(err.response?.data?.detail || 'Something went wrong');
+      const detail = err.response?.data?.detail;
+      setError(typeof detail === 'string' ? detail : detail?.[0]?.msg || 'Something went wrong');
     } finally {
       setLoading(false);
     }
@@ -43,7 +78,7 @@ export default function Login() {
         </div>
         <h1 className="auth-title">{isLogin ? 'Welcome back' : 'Create your account'}</h1>
 
-        <form onSubmit={handleSubmit}>
+        <form onSubmit={handleSubmit} noValidate>
           {!isLogin && (
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 14 }}>
               <div>
@@ -81,6 +116,7 @@ export default function Login() {
               type="email"
               autoComplete="email"
               required
+              pattern="[^\s@]+@[^\s@]+\.[^\s@]{2,}"
               value={formData.email}
               onChange={handleChange}
               className="field-input"
@@ -95,6 +131,7 @@ export default function Login() {
               type="password"
               autoComplete="current-password"
               required
+              minLength={isLogin ? undefined : 8}
               value={formData.password}
               onChange={handleChange}
               className="field-input"
